@@ -83,6 +83,7 @@
 
 (require 'json)
 (require 'vc)
+(load-file "~/.emacs.d/beacon/beacon.el")
 
 (defgroup disaster nil
   "Disassemble C/C++ under cursor (Works best with Clang)."
@@ -136,7 +137,7 @@
 
 (defcustom disaster-objdump
   (concat (if (eq system-type 'darwin) "gobjdump" "objdump")
-          " -d -M -m aarch64 -Sl --no-show-raw-insn")
+          " -d -m aarch64 -Sl --no-show-raw-insn")
   "The command name and flags for running objdump."
   :group 'disaster
   :type 'string)
@@ -183,6 +184,40 @@ Sublist are ordered from highest to lowest precedence."
 If nil is returned, the next function will be tried.  If all
 functions return nil, the project root directory will be used as
 the build directory.")
+
+(defun disaster-run-objdump (asm-file)
+  "Run objdump on the given assembly file and return the buffer with the assembly code."
+  (let ((obj-file (concat (file-name-sans-extension asm-file) ".o"))
+        (asm-buffer (get-buffer-create "*disaster*")))
+    (with-current-buffer asm-buffer
+      (goto-char (point-max))
+      (insert (shell-command-to-string (format "%s -D %s" disaster-objdump obj-file)))
+      (disaster--setup-assembly-mode))
+    asm-buffer))
+
+(defun disaster-run-clang (filename)
+  "Run clang on the given file and return the buffer with the assembly code."
+  (let ((asm-buffer (get-buffer-create "*disaster*")))
+    (with-current-buffer asm-buffer
+      (erase-buffer)  ; clear the buffer before running clang
+      (shell-command (format "clang -arch arm64 -S -o %s.s %s"
+                             (file-name-sans-extension filename) filename))
+      (find-file (concat (file-name-sans-extension filename) ".s"))
+      (disaster--setup-assembly-mode))))
+
+(defun disaster-get-object-file (filename line-number)
+  "Get the object file path for the given file name and line number."
+  (let* ((cwd (file-name-directory (expand-file-name filename)))
+         (obj-name (concat (file-name-sans-extension filename) ".o"))
+         (cc (if (string-match-p disaster-cpp-regexp filename) "c++" "cc"))
+         (obj-file (concat cwd obj-name)))
+    (if (file-exists-p obj-file)
+        obj-file
+      (progn
+        (shell-command (format "%s -g -c %s" cc filename))
+        (rename-file (concat cwd (file-name-sans-extension filename) ".o")
+                     obj-file)
+        obj-file))))
 
 (defun disaster-create-compile-command-make (make-root cwd rel-obj obj-file proj-root rel-file file)
   "Create compile command for a Make-based project.
@@ -249,94 +284,61 @@ OBJ-FILE: full path to object file (build root!)
 PROJ-ROOT: path to project root, REL-FILE FILE."
   (if use-cmake
       (disaster-create-compile-command-cmake make-root cwd rel-obj obj-file proj-root rel-file)
-    (disaster-create-compile-command-make make-root cwd rel-obj obj-file proj-root rel-file file)))
+    (disaster-create-compile-command-make make-root cwd rel-obj obj-file
+                                          proj-root rel-file file)))
+
+(defun disaster--setup-assembly-mode ()
+  "Set up `asm-mode` for the *disaster* buffer."
+  (setq tab-width 4)
+  (setq-local tab-stop-list (number-sequence 4 200 4))
+  (setq-local truncate-lines t))
+
+(defun disaster--highlight-line (line-text gobjdump-output)
+  "Highlight the line matching LINE-TEXT in the asm buffer and blink line."
+  (with-current-buffer "*disaster*"
+    (setq buffer-read-only nil)
+    (goto-char (point-min))
+    (when (re-search-forward (concat "^.*" (regexp-quote line-text) ".*$") nil t)
+      (let ((overlay (make-overlay (line-beginning-position) (line-end-position))))
+        (overlay-put overlay 'face 'region)
+        (overlay-put overlay 'priority 1)
+        (overlay-put overlay 'help-echo "Current line")
+        (beacon-blink))
+      (message "Line '%s' highlighted." line-text))
+    (message "Line '%s' not found." line-text)))
 
 ;;;###autoload
 (defun disaster (&optional file line)
-  "Show assembly code for current line of C/C++ file.
-
-Here's the logic path it follows:
-
-- Is there a complile_commands.json in this directory? Get the object file
-  name for the current file, and run it associated command.
-- Is there a Makefile in this directory? Run `make bufname.o`.
-- Or is there a Makefile in a parent directory? Run `make -C .. bufname.o`.
-- Or is this a C file? Run `cc -g -c -o bufname.o bufname.c`
-- Or is this a C++ file? Run `c++ -g -c -o bufname.o bufname.c`
-- If build failed, display errors in compile-mode.
-- Run objdump inside a new window while maintaining focus.
-- Jump to line matching current line.
-
-If FILE and LINE are not specified, the current editing location
-is used."
+  "Show assembly code for current LINE of C/C++ FILE in a new buffer and window called *disaster*."
   (interactive)
-  (save-buffer)
-  (let* ((file      (or file (file-name-nondirectory (buffer-file-name))))
-         (line      (or line (line-number-at-pos)))
-         (file-line (format "%s:%d" file line))
-         (makebuf   (get-buffer-create disaster-buffer-compiler))
-         (asmbuf    (get-buffer-create disaster-buffer-assembly)))
-    (if (or (string-match-p disaster-c-regexp file)
-            (string-match-p disaster-cpp-regexp file)
-            (string-match-p disaster-fortran-regexp file))
-        (let* ((cwd       (file-name-directory (expand-file-name (buffer-file-name)))) ;; path to current source file
-               (proj-root (disaster-find-project-root nil file)) ;; path to project root
-               (use-cmake (file-exists-p (concat proj-root "/compile_commands.json")))
-               (make-root (disaster-find-build-root use-cmake proj-root)) ;; path to build root
-               (rel-file  (if proj-root ;; path to source file (relative to project root)
-                              (file-relative-name file proj-root)
-                            file))
-               (rel-obj   (concat (file-name-sans-extension rel-file) ".o")) ;; path to object file (relative to project root)
-               (obj-file  (concat make-root rel-obj)) ;; full path to object file (build root!)
-               (cc        (disaster-create-compile-command use-cmake make-root cwd rel-obj obj-file proj-root rel-file file))
-               (dump      (format "%s %s" disaster-objdump
-                                  (shell-quote-argument (concat make-root rel-obj))))
+  (let* ((filename (or file (file-name-nondirectory (buffer-file-name))))
+         (line-number (or line (line-number-at-pos)))
+         (disaster-run-function (intern (completing-read "Select disassembler function: " '(disaster-run-clang disaster-run-objdump) nil t))))
+    (if (or (string-match-p disaster-c-regexp filename)
+            (string-match-p disaster-cpp-regexp filename)
+            (string-match-p disaster-fortran-regexp filename))
+        (let* ((gobjdump-output nil)
+               (asm-buffer (funcall disaster-run-function filename))
                (line-text (buffer-substring-no-properties
                            (point-at-bol)
                            (point-at-eol))))
+          (setq gobjdump-output (with-current-buffer asm-buffer
+                                  (buffer-string)))
+          (with-current-buffer asm-buffer
+            (disaster--highlight-line line-text gobjdump-output))
+          (with-current-buffer (get-buffer-create "*disaster*")
+            (setq buffer-read-only nil)
+            (goto-char (point-max))
+            (insert-buffer-substring asm-buffer)
+            (asm-mode))
+          (pop-to-buffer "*disaster*"))
+      (message "Not a C, C++ or Fortran source file."))))
 
-          ;; For CMake, read the object file from compile_commands.json
-          (when use-cmake
-            (let ((tmp (disaster-get-object-file-path-cmake cc)))
-              (setq obj-file (format "%s/%s" make-root tmp)
-                    cc       (format "cmake --build %s --target %s" make-root tmp)
-                    dump     (format "%s %s" disaster-objdump
-                                     (shell-quote-argument obj-file)))))
-
-          (if (and (eq 0 (progn
-                           (message (format "Running: %s" cc))
-                           (shell-command cc makebuf)))
-                   (file-exists-p obj-file))
-              (when (eq 0 (progn
-                            (message (format "Running: %s" dump))
-                            (shell-command dump asmbuf)))
-                (kill-buffer makebuf)
-                (with-current-buffer asmbuf
-                  ;; saveplace.el will prevent us from hopping to a line.
-                  (set (make-local-variable 'save-place-mode) nil)
-                  ;; Call the configured mode `asm-mode' or `nasm-mode'
-                  (when (fboundp disaster-assembly-mode)
-                    (funcall disaster-assembly-mode))
-                  (disaster--shadow-non-assembly-code))
-                (let ((oldbuf (current-buffer)))
-                  (switch-to-buffer-other-window asmbuf)
-                  (goto-char 0)
-                  (if (or (search-forward line-text nil t)
-                          (search-forward file-line nil t))
-                      (progn
-                        (recenter)
-                        (overlay-put (make-overlay (point-at-bol)
-                                                   (1+ (point-at-eol)))
-                                     'face 'region))
-                    (message "Couldn't find corresponding assembly line."))
-                  (switch-to-buffer-other-window oldbuf)))
-            (with-current-buffer makebuf
-              (save-excursion
-                (goto-char 0)
-                (insert (concat cc "\n")))
-              (compilation-mode)
-              (display-buffer makebuf))))
-      (message "Not a C, C++ or Fortran source file"))))
+;; Choose the run function based on the OS
+(defcustom disaster-run-function (if (eq system-type 'darwin) 'disaster-run-clang 'disaster-run-objdump)
+  "The function to run to disassemble the given file."
+  :group 'disaster
+  :type 'symbol)
 
 (defun disaster--shadow-non-assembly-code ()
   "Scans current buffer, which should be in `asm-mode'.
